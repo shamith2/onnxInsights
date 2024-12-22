@@ -1,0 +1,11 @@
+**/.pytest_cache/
+**/.cache
+**/__pycache__/
+
+**/*.onnx
+**/*.onnx_data
+
+weights/**/*.json
+weights/**/*.txt
+
+results/**/*.json
