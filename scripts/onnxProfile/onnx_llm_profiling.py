@@ -1,75 +1,90 @@
 # Script for profiling onnx model
 
 import os
-import sys
-
-import onnxruntime
-
 from pathlib import Path
 
-from onnxInsights.onnxHelpers import ONNXProfiler
-from onnxInsights.onnxHelpers import memoryView
+import onnxruntime
+from onnxInsights import ONNXProfiler, memoryView
 
 root = Path(__file__).parents[2].resolve()
 workspace = Path(__file__).parent.resolve()
 
 
-def get_shapes(model_path):
+def get_shapes(onnx_model_path, params: dict, verbose: bool = False):
+    """
+    Get input and output shapes for LLMs
+    """
     dummy_session = onnxruntime.InferenceSession(
-                    model_path,
-                    providers=["CPUExecutionProvider"]
-                )
-    
-    print("Inputs: ")
-    for _input in dummy_session.get_inputs():
-        print(_input.name, _input.shape, _input.type)
-    
-    print("Outputs: ")
-    for output in dummy_session.get_outputs():
-        print(output.name, output.shape, output.type)
-    
-    sys.exit()
+        onnx_model_path,
+        providers=["CPUExecutionProvider"]
+    )
+
+    if verbose:
+        print("Inputs: ")
+        for _input in dummy_session.get_inputs():
+            print(_input.name, _input.shape, _input.type)
+        
+        print("Outputs: ")
+        for output in dummy_session.get_outputs():
+            print(output.name, output.shape, output.type)
 
 
-# for llms
-PHASE = 'DECODEN'
-BATCH_SIZE = 1
-SEQ_LEN = 1024 if PHASE == 'PREFILL' else 1
-MAX_LEN = 2048
-CACHE_LEN = 1 if PHASE == 'PREFILL' else MAX_LEN - 1
-KV_CHANNELS = 1 # 8
-KV_EMBED_SIZE = 256 # 128
-OUTPUT_EMBED_SIZE = 256000 # 128256
+    for i, _input in enumerate(dummy_session.get_inputs()):
+        if 'past_key_values' in _input.name:
+            params['NON_CACHE_INPUT_INDEX'] = i
 
-# onnx_t = ONNXProfiler(
-#     model_name='llama3_8b_fp16_' + PHASE.lower() + 'Phase',
-#     model_dir='llama3_8b_fp16'
-# )
+            params['KV_CHANNELS'] = _input.shape[1]
+            params['KV_EMBED_SIZE'] = _input.shape[-1]
 
-onnx_t = ONNXProfiler(
-    model_name='gemma1.1_2b_fp16_' + PHASE.lower() + 'Phase',
-    model_dir='gemma1.1_2b_fp16'
-)
+            break
+
+    params['NUM_LAYERS'] = (len(dummy_session.get_inputs()) - params['NON_CACHE_INPUT_INDEX']) // 2
+    params['OUTPUT_EMBED_SIZE'] = dummy_session.get_outputs()[0].shape[-1]
+
+    assert params['NUM_LAYERS'] * 2 == len(dummy_session.get_outputs()) - 1
+
+    return params
 
 
-def shape_infer():
-    # uninferred_llm_onnx_model_path = os.path.join(workspace, 'models', 'rank_0_Meta-Llama-3-8B-Instruct_decoder_merged_model_fp16.onnx')
-    uninferred_llm_onnx_model_path = os.path.join(workspace, 'models', 'rank_0_gemma-1.1-2b-it_decoder_merged_model_fp16.onnx')
+def shape_infer(cls, params: dict):
+    """
+    Prepare input and output shapes and do shape infer for LLMs
+    """
+    params = get_shapes(params['PATH_TO_ONNX_MODEL'], params, verbose=False)
 
-    input_shapes = [(BATCH_SIZE, SEQ_LEN), (BATCH_SIZE, MAX_LEN), (BATCH_SIZE, SEQ_LEN)]
+    assert params['NON_CACHE_INPUT_INDEX'] <= 3, "shape_infer expects model to have 2-3 inputs apart from KV Cache"
 
-    for i in range(32):
-        input_shapes.append((BATCH_SIZE, KV_CHANNELS, CACHE_LEN, KV_EMBED_SIZE)) # for key
-        input_shapes.append((BATCH_SIZE, KV_CHANNELS, CACHE_LEN, KV_EMBED_SIZE)) # for value
+    params['SEQ_LEN'] = params['SEQ_LEN'] if params['PHASE'] == 'PREFILL' else 1
 
-    output_shapes = [(BATCH_SIZE, SEQ_LEN, OUTPUT_EMBED_SIZE)]
+    if 'DECODE' in args['PHASE']:
+        try:
+            CACHE_LEN = int(args['PHASE'][-1])
 
-    for i in range(32):
-        output_shapes.append((BATCH_SIZE, KV_CHANNELS, MAX_LEN, KV_EMBED_SIZE)) # for key
-        output_shapes.append((BATCH_SIZE, KV_CHANNELS, MAX_LEN, KV_EMBED_SIZE)) # for value
+        except Exception as _:
+            CACHE_LEN = args['MAX_LEN'] - 1
 
-    inferred_onnx_model_path = onnx_t.shapeInfer(
-        uninferred_llm_onnx_model_path,
+    else:
+        CACHE_LEN = 1
+
+    # inputs_shape := [input_ids, attention_mask]
+    input_shapes = [(params['BATCH_SIZE'], params['SEQ_LEN']), (params['BATCH_SIZE'], params['MAX_LEN'])]
+
+    # cache_position or position_ids
+    if params['NON_CACHE_INPUT_INDEX'] > 2:
+        input_shapes.append((params['BATCH_SIZE'], params['SEQ_LEN']))
+
+    for _ in range(params['NUM_LAYERS']):
+        input_shapes.append((params['BATCH_SIZE'], params['KV_CHANNELS'], CACHE_LEN, params['KV_EMBED_SIZE'])) # for key
+        input_shapes.append((params['BATCH_SIZE'], params['KV_CHANNELS'], CACHE_LEN, params['KV_EMBED_SIZE'])) # for value
+
+    output_shapes = [(params['BATCH_SIZE'], params['SEQ_LEN'], params['OUTPUT_EMBED_SIZE'])]
+
+    for _ in range(params['NUM_LAYERS']):
+        output_shapes.append((params['BATCH_SIZE'], params['KV_CHANNELS'], CACHE_LEN + 1, params['KV_EMBED_SIZE'])) # for key
+        output_shapes.append((params['BATCH_SIZE'], params['KV_CHANNELS'], CACHE_LEN + 1, params['KV_EMBED_SIZE'])) # for value
+
+    inferred_onnx_model_path = cls.shapeInfer(
+        params['PATH_TO_ONNX_MODEL'],
         None,
         input_shapes,
         output_shapes
@@ -78,40 +93,47 @@ def shape_infer():
     return inferred_onnx_model_path
 
 
-# inferred_onnx_model_path = shape_infer()
+if __name__ == '__main__':
+    args = {
+        # user-defined params: for llms
+        'PHASE': 'DECODEN',
+        'BATCH_SIZE': 1,
+        'SEQ_LEN': 1024,
+        'MAX_LEN': 2048,
 
-# inferred_onnx_model_path = os.path.join(root, 'results', 'onnxProfile', 'models', 'llama3_8b_fp16',
-#                                         'llama3_8b_fp16_decodenPhase_inferred.onnx')
+        # model specific params
+        'MODEL_DIR': 'gemma-1.1-2b-it-fp16-onnx',
+        'PATH_TO_ONNX_MODEL': os.path.join(workspace, 'models', 'gemma-1.1-2b-it-fp16-onnx', 'rank_0_gemma-1.1-2b-it_decoder_merged_model_fp16.onnx'),
+        'GENERATE_MEMORY_VIEW': True
+    }
 
-inferred_onnx_model_path = os.path.join(root, 'results', 'onnxProfile', 'models', 'gemma1.1_2b_fp16',
-                                        'gemma1.1_2b_fp16_decodenPhase_inferred.onnx')
-
-# onnx_t.profileModel(inferred_onnx_model_path)
-
-# local_memory_view = memoryView(
-#     model_dir='llama3_8b_fp16',
-#     model_profile='llama3_8b_fp16_decodenPhase_summary.csv',
-#     outputs_profile='llama3_8b_fp16_decodenPhase_track_output_summary.csv'
-# )
-
-local_memory_view = memoryView(
-    model_dir='gemma1.1_2b_fp16',
-    model_profile='gemma1.1_2b_fp16_decodenPhase_summary.csv',
-    outputs_profile='gemma1.1_2b_fp16_decodenPhase_track_output_summary.csv'
-)
-
-for local_memory_size in [1, 3, 9, 40, 80]: # range(1, 20 + 1, 1):
-    score = local_memory_view.run_with_cache(
-        local_memory_size=local_memory_size,
-        cache_size=0,
-        final_outputs=('logits'),
-        plot_memory=True
+    onnx_p = ONNXProfiler(
+        model_name=f"{args['MODEL_DIR']}_{args['PHASE'].lower()}Phase",
+        model_dir=args['MODEL_DIR']
     )
 
-    print("Local Memory Size: {}, Score: {}\n".format(local_memory_size, score))
+    # run profiler
+    inferred_onnx_model_path = shape_infer(onnx_p, params=args)
+    onnx_p.profileModel(inferred_onnx_model_path)
 
 
-# onnx_t.profileModelonCPU(inferred_onnx_model_path)
+    if args['GENERATE_MEMORY_VIEW']:
+        local_memory_view = memoryView(
+            model_dir=args['MODEL_DIR'],
+            model_profile=f"{args['MODEL_DIR']}_{args['PHASE'].lower()}Phase_summary.csv",
+            outputs_profile=f"{args['MODEL_DIR']}_{args['PHASE'].lower()}Phase_track_output_summary.csv"
+        )
 
-# onnx_t.modifyGraph(delete_block=['DequantizeLinear', 'Clip', 'QuantizeLinear'], upper_2_ok=False, only_middle=True)
+        for local_memory_size in [1, 3, 9, 40, 80]: # range(1, 20 + 1, 1):
+            score = local_memory_view.run_with_cache(
+                local_memory_size=local_memory_size,
+                cache_size=0,
+                final_outputs=('logits'),
+                plot_memory=True
+            )
 
+            print("Local Memory Size: {}, Score: {}\n".format(local_memory_size, score))
+
+
+    # onnx_p.profileModelonCPU(inferred_onnx_model_path)
+    # onnx_p.modifyGraph(delete_block=['DequantizeLinear', 'Clip', 'QuantizeLinear'], upper_2_ok=False, only_middle=True)

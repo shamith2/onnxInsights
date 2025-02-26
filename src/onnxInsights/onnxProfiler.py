@@ -1,7 +1,22 @@
-# This script contains functions for profiling and modifying ONNX graphs
+"""
+ONNX Profiler: Profiling and Modifying ONNX Graphs
+
+This script provides functionality to analyze ONNX models by computing memory usage,
+parameter counts, and compute operations. It also supports modifying the ONNX graph
+by removing specific operator blocks.
+
+Features:
+- Computes memory usage (input, output, and weight tensors)
+- Estimates compute operations (MACs) for each operator
+- Summarizes model compute/memory statistics
+- Performs shape inference using ONNX symbolic shape inference
+- Profiles model execution on CPU
+- Modifies ONNX graphs by removing selected operators
+"""
 
 import copy
 import os
+import sys
 
 import numpy
 import onnx
@@ -15,7 +30,6 @@ import shutil
 import onnxruntime
 from onnxruntime.tools.symbolic_shape_infer import SymbolicShapeInference
 
-from .onnxBenchmark import get_random_input
 from .onnxOPS import OPERATORS
 
 import pandas
@@ -44,6 +58,48 @@ DTYPES = {
 
 
 # Helper Functions
+# infer the numpy dtype for inputs and outputs
+def get_numpy_dtype(input_type: str):
+    """
+    Returns the corresponding NumPy dtype for an ONNX tensor type
+    """
+    if input_type == "tensor(float16)":
+        return numpy.float16
+
+    elif input_type == "tensor(float)":
+        return numpy.float32
+    
+    elif input_type == "tensor(long)" or input_type == "tensor(int64)":
+        return numpy.int64
+
+    elif input_type == "tensor(double)":
+        return numpy.double
+    
+    elif input_type == "tensor(int32)":
+        return numpy.int32
+    
+    elif input_type == "tensor(uint)":
+        return numpy.uint8
+
+    else:
+        return numpy.float64
+
+
+# generate random input images instead of real images; batch size = 1
+# input data size := (b, h, w, c)
+def get_random_input(
+        input_shape: list[int],
+        input_type: str,
+        batch_size: int = 1
+):
+    """
+    Generates a random input tensor for model inference testing
+    """
+    input_data = (255 * numpy.random.random_sample([batch_size] + input_shape[1:])).astype(
+        get_numpy_dtype(input_type))
+
+    return input_data
+
 
 def checkandSaveModel(
     model: onnx.ModelProto,
@@ -51,6 +107,9 @@ def checkandSaveModel(
     save_directory: str,
     filename: str
 ) -> int:
+    """
+    Checks and saves an ONNX model, handling external data if needed
+    """
     if filename.endswith(extension):
         filename_with_extension = os.path.join(save_directory, filename)
         filename = filename.removesuffix(extension)
@@ -125,6 +184,14 @@ def _convert_shape_tuple_to_string(
 
 
 class ONNXProfiler:
+    """
+    ONNX Profiler class for analyzing and modifying ONNX models
+    
+    Attributes:
+        model_name (str): Name of the ONNX model
+        model_dir (str): Directory for saving profiling results
+    """
+
     def __init__(
             self,
             model_name: str,
@@ -132,7 +199,7 @@ class ONNXProfiler:
     ):
         self.extension = '.onnx'
 
-        self.root = Path(__file__).parents[3].resolve()
+        self.root = Path(__file__).parents[2].resolve()
         self.workspace = Path(__file__).parent.resolve()
 
         self.model_name = model_name
@@ -244,6 +311,9 @@ class ONNXProfiler:
             static_input_dims: list,
             static_output_dims: list
     ) -> str:
+        """
+        Performs symbolic shape inference on the ONNX model
+        """
         if not inferred_model_file:
             _inferred_model_file = self.model_name + '_inferred'
         
@@ -342,6 +412,10 @@ class ONNXProfiler:
             op_type = self.valid_nodes_list[name_of_nodes.index(node)][1].upper()
 
             if wb_param_size == 0:
+                if op_type not in OPERATORS:
+                    logging.error(f"Cannot find {op_type} in onnxOPS.py")
+                    sys.exit(1)
+
                 self.op_macs_dict[node] = ((self.output_params_dict[node][0][0] * OPERATORS[op_type][0]['OPS'],),)
 
             else:
@@ -356,10 +430,14 @@ class ONNXProfiler:
                 elif op_type == 'MUL':                    
                     # multiply_const = numpy.prod(self.node_input_dict[node][1][0], dtype=numpy.int64)
                     multiply_const = self.input_params_dict[node][0][0]
-                    
+
                     self.op_macs_dict[node] = ((multiply_const * OPERATORS[op_type][0]['OPS'],),)
-                
+
                 else:
+                    if op_type not in OPERATORS:
+                        logging.error(f"Cannot find {op_type} in onnxOPS.py")
+                        sys.exit(1)
+
                     self.op_macs_dict[node] = ((self.output_params_dict[node][0][0] * OPERATORS[op_type][0]['OPS'],),)
 
 
@@ -367,6 +445,9 @@ class ONNXProfiler:
             self,
             onnx_model_path: str
     ) -> int:
+        """
+        Profiles the ONNX model to compute memory and compute statistics
+        """
         logger.info("Profiling Model")
 
         # onnx model graph for profiling
@@ -634,12 +715,12 @@ class ONNXProfiler:
 
         # grouping by operator        
         grouped_dataframe = dataframe[['Operator', 'Number of Params', 'Params (%)',
-                                           'Compute Operations', 'Compute Operations (%)',
-                                           'Memory (in Bytes)', 'Memory (%)', 'Read Memory (in Bytes)',
-                                           'Write Memory (in Bytes)', 'Weights and Bias Memory (in Bytes)',
-                                           'Weights and Bias Memory (%)', 'Output Memory (in Bytes)',
-                                           'Output Memory (%)', 'Memory (in MB)', 'Read Memory (in MB)',
-                                           'Write Memory (in MB)']].groupby(['Operator'], as_index=False).sum()
+                                        'Compute Operations', 'Compute Operations (%)',
+                                        'Memory (in Bytes)', 'Memory (%)', 'Read Memory (in Bytes)',
+                                        'Write Memory (in Bytes)', 'Weights and Bias Memory (in Bytes)',
+                                        'Weights and Bias Memory (%)', 'Output Memory (in Bytes)',
+                                        'Output Memory (%)', 'Memory (in MB)', 'Read Memory (in MB)',
+                                        'Write Memory (in MB)']].groupby(['Operator'], as_index=False).sum()
 
         # operator count and percent
         grouped_dataframe.insert(1, 'Count', pandas.Series(list(dataframe.groupby('Operator').size())))
